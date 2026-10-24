@@ -1,0 +1,204 @@
+# Compilación y pruebas EN PÚBLICO (BRIEF §6). Va en el repositorio público `agenda-releases`,
+# en .github/workflows/build.yml.
+#
+# Dos trabajos, para que el código del proyecto nunca tenga un token con permiso de escritura:
+#  1. build (windows-latest, permissions: {}): descarga `agenda` con AGENDA_READ_TOKEN (solo
+#     lectura; no se guarda en disco), comprueba la configuración, pasa TODAS las pruebas
+#     (tipos, Vitest, configuración, cargo test, cargo audit, npm audit, Playwright con el Edge
+#     del runner y WebDriver en Windows real), compila el instalador NSIS SIN firma del
+#     actualizador (createUpdaterArtifacts: false; aquí no hay ninguna clave), lo instala, lo
+#     prueba, lo desinstala y lo sube como artefacto de 1 día. Este trabajo ejecuta código del
+#     proyecto (build.rs, macros, pruebas), así que no tiene ningún permiso del GITHUB_TOKEN.
+#  2. release (ubuntu-latest): NO ejecuta código del proyecto. Descarga el artefacto, recalcula
+#     su SHA-256, firma su procedencia (attest-build-provenance), crea el BORRADOR de release
+#     con el .exe como único archivo y escribe en el resumen el release_id, el SHA-256 y el
+#     commit de `agenda` compilado.
+# Cuándo se ejecuta: solo a mano (workflow_dispatch). Nunca desde pull requests.
+# A qué contacta: github.com (código privado, artefactos y API de releases), crates.io,
+# registry.npmjs.org, rustup y el servicio de atestaciones de GitHub (Sigstore). No descarga
+# navegadores: usa el Edge del runner.
+# Coste: 0 minutos (repositorio público con runners estándar). Duración estimada sin medir:
+# 40–50 min (compilar Rust en release, cargo-audit y tauri-driver; la caché solo guarda el
+# registro de crates).
+# Los registros son públicos: no se imprime ningún secreto ni dato del usuario.
+name: Compilar y probar
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  TAURI_DRIVER_VERSION: 2.1.0
+  CARGO_AUDIT_VERSION: 0.22.2
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions: {}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      installer: ${{ steps.meta.outputs.installer }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Descargar el código privado (solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: carlosmartinezdiez1-prog/agenda
+          ref: main
+          token: ${{ secrets.AGENDA_READ_TOKEN }}
+          persist-credentials: false
+          path: src
+
+      - name: Versión, commit e instalador esperado
+        id: meta
+        working-directory: src
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versión no válida: $version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "commit=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          "installer=Agenda_${version}_x64-setup.exe" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Caché del registro de crates (sin target/ ni ejecutables)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ hashFiles('src/src-tauri/Cargo.lock') }}
+
+      - name: Herramientas (versiones fijas)
+        run: |
+          cargo install --locked cargo-audit --version $env:CARGO_AUDIT_VERSION
+          cargo install --locked tauri-driver --version $env:TAURI_DRIVER_VERSION
+
+      - name: Dependencias de npm (sin scripts de instalación)
+        working-directory: src
+        run: npm ci --ignore-scripts
+
+      - name: Comprobaciones y pruebas
+        working-directory: src
+        run: |
+          node scripts/check-release-config.mjs
+          npm run test:config
+          npm run check
+          npm test
+          npm run test:rust
+          npm audit --audit-level=high
+
+      - name: cargo audit (lee src-tauri/.cargo/audit.toml)
+        working-directory: src/src-tauri
+        run: cargo audit
+
+      - name: Pruebas de interfaz (Playwright, con el Edge del runner)
+        working-directory: src
+        # playwright.config.ts usa channel: 'msedge' con CI en Windows: no se descarga ningún navegador
+        run: npm run test:e2e
+
+      - name: Compilar el instalador (sin firma del actualizador)
+        working-directory: src
+        run: |
+          $buildArgs = @('--ci')
+          if (Test-Path src-tauri/tauri.updater.conf.json) {
+            $buildArgs += @('--config', 'src-tauri/tauri.updater.conf.json')
+          } else {
+            Write-Host '::warning::Sin tauri.updater.conf.json: el actualizador va desactivado en esta versión'
+          }
+          npm run tauri build -- @buildArgs
+          $exe = 'src-tauri/target/release/bundle/nsis/${{ steps.meta.outputs.installer }}'
+          if (-not (Test-Path $exe)) { throw "No se ha generado $exe" }
+
+      - name: Instalar Agenda (el instalador recién compilado)
+        working-directory: src
+        run: ./scripts/windows-install-test.ps1 -Step install -Installer (Resolve-Path 'src-tauri/target/release/bundle/nsis/${{ steps.meta.outputs.installer }}').Path
+
+      - name: Pruebas WebDriver en Windows
+        working-directory: src/tests/webdriver
+        run: |
+          # Lockfile propio. Sin scripts: el msedgedriver es el del runner (EDGEWEBDRIVER)
+          npm ci --ignore-scripts --no-audit --no-fund
+          $env:AGENDA_EXE = Join-Path $env:LOCALAPPDATA 'Agenda\agenda.exe'
+          npm test
+
+      - name: Desinstalar y comprobar que no queda nada
+        working-directory: src
+        run: ./scripts/windows-install-test.ps1 -Step uninstall
+
+      - name: Subir SOLO el instalador (1 día)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: instalador
+          path: src/src-tauri/target/release/bundle/nsis/${{ steps.meta.outputs.installer }}
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # crear el borrador en ESTE repositorio
+      id-token: write # atestación de procedencia (Sigstore)
+      attestations: write
+    steps:
+      # Ningún checkout: este trabajo no ejecuta código del proyecto
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: instalador
+          path: out
+
+      - name: Comprobar el instalador y calcular su SHA-256
+        id: sum
+        env:
+          INSTALLER: ${{ needs.build.outputs.installer }}
+        run: |
+          [[ "$INSTALLER" =~ ^Agenda_[0-9]+\.[0-9]+\.[0-9]+_x64-setup\.exe$ ]] || { echo "::error::Nombre inesperado"; exit 1; }
+          [ "$(ls out)" = "$INSTALLER" ] || { echo "::error::El artefacto debe traer solo $INSTALLER"; exit 1; }
+          echo "sha256=$(sha256sum "out/$INSTALLER" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Firmar la procedencia (atestación)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/${{ needs.build.outputs.installer }}
+
+      - name: Crear el borrador de release con el instalador
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+          INSTALLER: ${{ needs.build.outputs.installer }}
+          SHA256: ${{ steps.sum.outputs.sha256 }}
+        run: |
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Commit no válido"; exit 1; }
+          notes=$(printf 'Agenda %s (sin firmar todavía).\n\nInstalador: %s\nSHA-256: %s\nCommit de agenda: %s\n' "$VERSION" "$INSTALLER" "$SHA256" "$COMMIT")
+          # Con la API: un borrador no tiene etiqueta todavía, así que se identifica por su id
+          release_id=$(jq -n --arg tag "v$VERSION" --arg name "Agenda $VERSION" --arg body "$notes" \
+              '{tag_name: $tag, name: $name, body: $body, draft: true}' \
+            | gh api -X POST "repos/$GITHUB_REPOSITORY/releases" --input - --jq .id)
+          gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$INSTALLER" \
+            -H 'Content-Type: application/octet-stream' --input "out/$INSTALLER" > /dev/null
+          {
+            echo "## Borrador de release creado"
+            echo
+            echo "| Dato | Valor |"
+            echo "|---|---|"
+            echo "| Versión | \`$VERSION\` |"
+            echo "| release_id | \`$release_id\` |"
+            echo "| Instalador | \`$INSTALLER\` |"
+            echo "| SHA-256 | \`$SHA256\` |"
+            echo "| Commit de agenda | \`$COMMIT\` |"
+            echo
+            echo "Para firmar y publicar: en \`agenda\`, lanzar **Firmar y publicar** con la versión, el release_id y el SHA-256 de ESTE resumen."
+          } >> "$GITHUB_STEP_SUMMARY"
