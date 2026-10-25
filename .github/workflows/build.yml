@@ -21,6 +21,10 @@
 # 40–50 min (compilar Rust en release, cargo-audit y tauri-driver; la caché solo guarda el
 # registro de crates).
 # Los registros son públicos: no se imprime ningún secreto ni dato del usuario.
+# Códigos de salida: con `shell: pwsh`, GitHub solo mira el código del ÚLTIMO comando nativo de
+# cada paso. Por eso va un comando nativo por paso y, donde un paso necesita varios, cada uno va
+# seguido de `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` (lo comprueba
+# scripts/check-release-config.mjs).
 name: Compilar y probar
 
 on:
@@ -65,8 +69,10 @@ jobs:
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versión no válida: $version" }
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "version=$version" >> $env:GITHUB_OUTPUT
-          "commit=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          "commit=$commit" >> $env:GITHUB_OUTPUT
           "installer=Agenda_${version}_x64-setup.exe" >> $env:GITHUB_OUTPUT
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -79,24 +85,39 @@ jobs:
           path: ~/.cargo/registry
           key: cargo-registry-${{ hashFiles('src/src-tauri/Cargo.lock') }}
 
-      - name: Herramientas (versiones fijas)
-        run: |
-          cargo install --locked cargo-audit --version $env:CARGO_AUDIT_VERSION
-          cargo install --locked tauri-driver --version $env:TAURI_DRIVER_VERSION
+      - name: Herramientas, cargo-audit (versión fija)
+        run: cargo install --locked cargo-audit --version $env:CARGO_AUDIT_VERSION
+
+      - name: Herramientas, tauri-driver (versión fija)
+        run: cargo install --locked tauri-driver --version $env:TAURI_DRIVER_VERSION
 
       - name: Dependencias de npm (sin scripts de instalación)
         working-directory: src
         run: npm ci --ignore-scripts
 
-      - name: Comprobaciones y pruebas
+      - name: Comprobar la configuración de la versión
         working-directory: src
-        run: |
-          node scripts/check-release-config.mjs
-          npm run test:config
-          npm run check
-          npm test
-          npm run test:rust
-          npm audit --audit-level=high
+        run: node scripts/check-release-config.mjs
+
+      - name: Pruebas de la comprobación de configuración
+        working-directory: src
+        run: npm run test:config
+
+      - name: Tipos (svelte-check)
+        working-directory: src
+        run: npm run check
+
+      - name: Pruebas unitarias (Vitest)
+        working-directory: src
+        run: npm test
+
+      - name: Pruebas de Rust y clippy
+        working-directory: src
+        run: npm run test:rust
+
+      - name: npm audit
+        working-directory: src
+        run: npm audit --audit-level=high
 
       - name: cargo audit (lee src-tauri/.cargo/audit.toml)
         working-directory: src/src-tauri
@@ -117,6 +138,7 @@ jobs:
             Write-Host '::warning::Sin tauri.updater.conf.json: el actualizador va desactivado en esta versión'
           }
           npm run tauri build -- @buildArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $exe = 'src-tauri/target/release/bundle/nsis/${{ steps.meta.outputs.installer }}'
           if (-not (Test-Path $exe)) { throw "No se ha generado $exe" }
 
@@ -129,6 +151,7 @@ jobs:
         run: |
           # Lockfile propio. Sin scripts: el msedgedriver es el del runner (EDGEWEBDRIVER)
           npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:AGENDA_EXE = Join-Path $env:LOCALAPPDATA 'Agenda\agenda.exe'
           npm test
 
