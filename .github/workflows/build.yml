@@ -14,6 +14,8 @@
 #     con el .exe como único archivo y escribe en el resumen el release_id, el SHA-256 y el
 #     commit de `agenda` compilado.
 # Cuándo se ejecuta: solo a mano (workflow_dispatch). Nunca desde pull requests.
+# Con la entrada `ref` distinta de main (experimentos, como el del cristal de la 0.2.3) se compila
+# y se prueba esa rama o ese commit, pero el trabajo release no se ejecuta: no hay borrador.
 # A qué contacta: github.com (código privado, artefactos y API de releases), crates.io,
 # registry.npmjs.org, rustup y el servicio de atestaciones de GitHub (Sigstore). No descarga
 # navegadores: usa el Edge del runner.
@@ -29,6 +31,11 @@ name: Compilar y probar
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Rama o commit de agenda. Si no es main, es un experimento: se compila y se prueba, pero no se crea ningún borrador de release.'
+        type: string
+        default: main
 
 permissions: {}
 
@@ -58,7 +65,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: carlosmartinezdiez1-prog/agenda
-          ref: main
+          # Solo en `with:`, nunca dentro de un `run:` (no se interpreta como código)
+          ref: ${{ inputs.ref }}
           token: ${{ secrets.AGENDA_READ_TOKEN }}
           persist-credentials: false
           path: src
@@ -159,6 +167,15 @@ jobs:
         working-directory: src
         run: ./scripts/windows-install-test.ps1 -Step uninstall
 
+      - name: Subir el recorte de la prueba del cristal (1 día; solo el recuadro recién instalado)
+        if: success() || failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cristal
+          path: ${{ runner.temp }}/cristal/recuadro.png
+          retention-days: 1
+          if-no-files-found: warn
+
       - name: Subir SOLO el instalador (1 día)
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -168,6 +185,8 @@ jobs:
           if-no-files-found: error
 
   release:
+    # Un experimento (otra rama u otro commit) no crea borrador
+    if: inputs.ref == 'main'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
